@@ -6,12 +6,17 @@ import android.app.DownloadManager;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.Bitmap;
+import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
+import android.support.annotation.RequiresApi;
 import android.text.TextUtils;
+import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.ViewGroup.LayoutParams;
+import android.view.WindowManager;
 import android.webkit.ConsoleMessage;
 import android.webkit.CookieManager;
 import android.webkit.DownloadListener;
@@ -24,6 +29,7 @@ import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.FrameLayout;
 
 import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.LifecycleEventListener;
@@ -137,59 +143,7 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
   @TargetApi(Build.VERSION_CODES.LOLLIPOP)
   protected WebView createViewInstance(ThemedReactContext reactContext) {
     RNCWebView webView = createRNCWebViewInstance(reactContext);
-    webView.setWebChromeClient(new WebChromeClient() {
-      @Override
-      public boolean onConsoleMessage(ConsoleMessage message) {
-        if (ReactBuildConfig.DEBUG) {
-          return super.onConsoleMessage(message);
-        }
-        // Ignore console logs in non debug builds.
-        return true;
-      }
-
-
-      @Override
-      public void onProgressChanged(WebView webView, int newProgress) {
-        super.onProgressChanged(webView, newProgress);
-        WritableMap event = Arguments.createMap();
-        event.putDouble("target", webView.getId());
-        event.putString("title", webView.getTitle());
-        event.putBoolean("canGoBack", webView.canGoBack());
-        event.putBoolean("canGoForward", webView.canGoForward());
-        event.putDouble("progress", (float) newProgress / 100);
-        dispatchEvent(
-          webView,
-          new TopLoadingProgressEvent(
-            webView.getId(),
-            event));
-      }
-
-      @Override
-      public void onGeolocationPermissionsShowPrompt(String origin, GeolocationPermissions.Callback callback) {
-        callback.invoke(origin, true, false);
-      }
-
-      protected void openFileChooser(ValueCallback<Uri> filePathCallback, String acceptType) {
-        getModule(reactContext).startPhotoPickerIntent(filePathCallback, acceptType);
-      }
-
-      protected void openFileChooser(ValueCallback<Uri> filePathCallback) {
-        getModule(reactContext).startPhotoPickerIntent(filePathCallback, "");
-      }
-
-      protected void openFileChooser(ValueCallback<Uri> filePathCallback, String acceptType, String capture) {
-        getModule(reactContext).startPhotoPickerIntent(filePathCallback, acceptType);
-      }
-
-      @TargetApi(Build.VERSION_CODES.LOLLIPOP)
-      @Override
-      public boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> filePathCallback, FileChooserParams fileChooserParams) {
-        String[] acceptTypes = fileChooserParams.getAcceptTypes();
-        boolean allowMultiple = fileChooserParams.getMode() == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE;
-        Intent intent = fileChooserParams.createIntent();
-        return getModule(reactContext).startPhotoPickerIntent(filePathCallback, intent, acceptTypes, allowMultiple);
-      }
-    });
+    webView.setWebChromeClient(new RNCWebChromeClient(reactContext, webView));
     reactContext.addLifecycleEventListener(webView);
     mWebViewConfig.configWebView(webView);
     WebSettings settings = webView.getSettings();
@@ -373,8 +327,12 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
     if (source != null) {
       if (source.hasKey("html")) {
         String html = source.getString("html");
-        String baseUrl = source.hasKey("baseUrl") ? source.getString("baseUrl") : "";
-        view.loadDataWithBaseURL(baseUrl, html, HTML_MIME_TYPE, HTML_ENCODING, null);
+        if (source.hasKey("baseUrl")) {
+          view.loadDataWithBaseURL(
+            source.getString("baseUrl"), html, HTML_MIME_TYPE, HTML_ENCODING, null);
+        } else {
+          view.loadData(html, HTML_MIME_TYPE + "; charset=" + HTML_ENCODING, null);
+        }
         return;
       }
       if (source.hasKey("uri")) {
@@ -552,7 +510,7 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
     ((RNCWebView) webView).cleanupCallbacksAndDestroy();
   }
 
-  public RNCWebViewModule getModule(ReactContext reactContext) {
+  public static RNCWebViewModule getModule(ReactContext reactContext) {
     return reactContext.getNativeModule(RNCWebViewModule.class);
   }
 
@@ -650,6 +608,143 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
 
     public void setUrlPrefixesForDefaultIntent(ReadableArray specialUrls) {
       mUrlPrefixesForDefaultIntent = specialUrls;
+    }
+  }
+
+  protected static class RNCWebChromeClient extends WebChromeClient implements LifecycleEventListener {
+    protected static final FrameLayout.LayoutParams FULLSCREEN_LAYOUT_PARAMS = new FrameLayout.LayoutParams(
+      LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT, Gravity.CENTER);
+
+    @RequiresApi(api = Build.VERSION_CODES.KITKAT)
+    protected static final int FULLSCREEN_SYSTEM_UI_VISIBILITY = View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION |
+      View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
+      View.SYSTEM_UI_FLAG_LAYOUT_STABLE |
+      View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
+      View.SYSTEM_UI_FLAG_FULLSCREEN |
+      View.SYSTEM_UI_FLAG_IMMERSIVE |
+      View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY;
+
+    protected ReactContext mReactContext;
+    protected View mWebView;
+
+    protected View mVideoView;
+    protected WebChromeClient.CustomViewCallback mCustomViewCallback;
+
+    public RNCWebChromeClient(ReactContext reactContext, WebView webView) {
+      this.mReactContext = reactContext;
+      this.mWebView = webView;
+    }
+
+    @Override
+    public void onShowCustomView(View view, CustomViewCallback callback) {
+      if (mVideoView != null) {
+        callback.onCustomViewHidden();
+        return;
+      }
+
+      mVideoView = view;
+      mCustomViewCallback = callback;
+
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+        mVideoView.setSystemUiVisibility(FULLSCREEN_SYSTEM_UI_VISIBILITY);
+        mReactContext.getCurrentActivity().getWindow().setFlags(WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS, WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
+      }
+
+      mVideoView.setBackgroundColor(Color.BLACK);
+      getRootView().addView(mVideoView, FULLSCREEN_LAYOUT_PARAMS);
+      mWebView.setVisibility(View.GONE);
+
+      mReactContext.addLifecycleEventListener(this);
+    }
+
+    @Override
+    public void onHideCustomView() {
+      if (mVideoView == null) {
+        return;
+      }
+
+      mVideoView.setVisibility(View.GONE);
+      getRootView().removeView(mVideoView);
+      mCustomViewCallback.onCustomViewHidden();
+
+      mVideoView = null;
+      mCustomViewCallback = null;
+
+      mWebView.setVisibility(View.VISIBLE);
+
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+        mReactContext.getCurrentActivity().getWindow().clearFlags(WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
+      }
+
+      mReactContext.removeLifecycleEventListener(this);
+    }
+
+    @Override
+    public boolean onConsoleMessage(ConsoleMessage message) {
+      if (ReactBuildConfig.DEBUG) {
+        return super.onConsoleMessage(message);
+      }
+      // Ignore console logs in non debug builds.
+      return true;
+    }
+
+    @Override
+    public void onProgressChanged(WebView webView, int newProgress) {
+      super.onProgressChanged(webView, newProgress);
+      WritableMap event = Arguments.createMap();
+      event.putDouble("target", webView.getId());
+      event.putString("title", webView.getTitle());
+      event.putBoolean("canGoBack", webView.canGoBack());
+      event.putBoolean("canGoForward", webView.canGoForward());
+      event.putDouble("progress", (float) newProgress / 100);
+      dispatchEvent(
+        webView,
+        new TopLoadingProgressEvent(
+          webView.getId(),
+          event));
+    }
+
+    @Override
+    public void onGeolocationPermissionsShowPrompt(String origin, GeolocationPermissions.Callback callback) {
+      callback.invoke(origin, true, false);
+    }
+
+    protected void openFileChooser(ValueCallback<Uri> filePathCallback, String acceptType) {
+      getModule(mReactContext).startPhotoPickerIntent(filePathCallback, acceptType);
+    }
+
+    protected void openFileChooser(ValueCallback<Uri> filePathCallback) {
+      getModule(mReactContext).startPhotoPickerIntent(filePathCallback, "");
+    }
+
+    protected void openFileChooser(ValueCallback<Uri> filePathCallback, String acceptType, String capture) {
+      getModule(mReactContext).startPhotoPickerIntent(filePathCallback, acceptType);
+    }
+
+    @TargetApi(Build.VERSION_CODES.LOLLIPOP)
+    @Override
+    public boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> filePathCallback, FileChooserParams fileChooserParams) {
+      String[] acceptTypes = fileChooserParams.getAcceptTypes();
+      boolean allowMultiple = fileChooserParams.getMode() == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE;
+      Intent intent = fileChooserParams.createIntent();
+      return getModule(mReactContext).startPhotoPickerIntent(filePathCallback, intent, acceptTypes, allowMultiple);
+    }
+
+    @Override
+    public void onHostResume() {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT && mVideoView != null && mVideoView.getSystemUiVisibility() != FULLSCREEN_SYSTEM_UI_VISIBILITY) {
+        mVideoView.setSystemUiVisibility(FULLSCREEN_SYSTEM_UI_VISIBILITY);
+      }
+    }
+
+    @Override
+    public void onHostPause() { }
+
+    @Override
+    public void onHostDestroy() { }
+
+    protected ViewGroup getRootView() {
+      return (ViewGroup) mReactContext.getCurrentActivity().findViewById(android.R.id.content);
     }
   }
 
